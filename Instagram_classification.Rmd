@@ -1,0 +1,414 @@
+---
+title: "Instagram Classification"
+subtitle: "Spam Account Detection"
+date: '`r Sys.Date()`'
+author: Ra'Shawn Howard
+output: pdf_document
+---
+
+# Data Description
+
+Fakes and spammers are a major problem on all social media platforms, including Instagram. [kaggler](https://www.kaggle.com/free4ever1/instagram-fake-spammer-genuine-accounts) has personally identified the spammer/fake accounts included in this dataset after carefully examining each instance and as such the dataset has high level of accuracy. The dataset has been collected using a crawler from 15-19, March 2019. The response variable is fake, and is coded 0=genuine and 1=spam. There are 11 predictors in the data:
+
++ profile picture, user has profile picture, or not (coded 0=no picture, 1=has picture)
++ nums length user, this is the ratio of number of numerical chars in username to its length
++ full name words, full name in word tokens
++ nums length full name, the ratio of the number of numerical characters in full name to its length
++ name username, are username and full name literally the same (coded 0=not same, 1=same)
++ description length, bio length in characters
++ external url, has external url or not (coded 0=no external url, 1=has external url)
++ private or not, is the account set to  private viewer ship (coded 0=not private, 1=private)
++ posts, number of posts
++ followers, number of followers
++ follows, number of accounts followed
+
+```{r setup, include=FALSE}
+
+# Initial Libraries
+library(tidyverse)
+library(tidymodels)
+
+# Global Options
+knitr::opts_chunk$set(echo = FALSE, include = FALSE, warning = FALSE, message = FALSE)
+
+theme_set(ggthemes::theme_pander())
+
+# Load Data
+df1 <- read_csv("/Users/rashawnhoward/Downloads/archive-2/test.csv")
+
+df2 <- read_csv("/Users/rashawnhoward/Downloads/archive-2/train.csv")
+
+data <- df1 %>% 
+  bind_rows(df2) %>% # Combine the two dataframes
+  janitor::clean_names() %>%  # put predictor names in better format
+  mutate(fake = as.factor(fake))
+```
+
+# Split Data
+Before building these models, we will split the data into one set that will be used to develop models, preprocess the predictors, and explore relationships among the predictors and the response (the training set) and another that will be the final arbiter of the predictor set/model combination performance (the test set). To partition the data, the splitting of the orignal data set will be done in a stratified manner by making random splits in each of the outcome classes. This will keep the proportion of fake accounts approximately the same. In the splitting, 82% of the data were allocated to the training set. 10-fold cross-validation were used to tune the models
+```{r}
+set.seed(2021) # for reproducibility
+splits <- initial_split(data, prop = .82, strata = fake)
+
+train <- training(splits)
+head(train)
+```
+
+
+# EDA
+
+### Are there any missing values?
+```{r missingness, include=TRUE}
+# Are there any missing values?
+DataExplorer::plot_missing(train, title = "There Are No Missing Values")
+
+#train %>% 
+  #summarise_all(~sum(is.na(.))) # Another way to see number of missing values for each column
+```
+
+### What does the distribution of the qualitative variables look like?
+We can see that our response variable is balanced, but our predictor variables are defficient 
+```{r qual-dist, include=TRUE}
+DataExplorer::plot_bar(train, title = "Qualitative Variables")
+```
+
+### What does the distribution of the quantitative variables look like?
+Some type of transformation may be needed, dependening on the type of model used.
+```{r quant-dist, include=TRUE}
+DataExplorer::plot_histogram(train, title = "The Distributions Are Heavly Right Skewed")
+```
+
+### Does removing outliers help the distribution of the predictors?
+```{r}
+train %>%  
+  dplyr::select(-fake,-private,-profile_pic,-name_username,-external_url) %>% 
+  dlookr::plot_outlier()
+```
+
+### Are any of the predictors normally distributed?
+None of the predictors are normally distributed. We can see that a log transformation helps the skewness of the predictors. Incorperating boxcox or yeojohnson transformation during the preprocessing step could have significant impact on model performance, depending on which model we use.
+```{r}
+train %>%  
+  dplyr::select(-fake,-private,-profile_pic,-name_username,-external_url) %>% 
+  dlookr::plot_normality()
+```
+
+### Is there any highly correlated predictors?
+Looking at the distribution of the predictors, as well as the qqplots we can see that the predictors are not normally distributed. This would lead to picking correlation coefficient other than pearson. We could use robust correlation, or we could use spearman correlation. From the plot below, we can see that all of the correlations are significant at the .05 level, when using either of these methods. Strongly positive Spearman's correlations indicate that high ranks of one variable tend to coincide with high ranks of the other variable. Negative correlations signify that high ranks of one variable frequently occur with low ranks of the other variable. We can see that high ranks of number of followers coincide with high ranks of number of posts. Same with number of follows and number of followers. Some models are highly sensitive to highly correlated data, maybe partial least square (PLS), or principal conponent analysis can be utilized for models such as nueral networks.
+```{r}
+train %>% 
+  dplyr::select(-fake,-private,-profile_pic,-name_username,-external_url) %>%
+  pairs(col =as.factor(train$fake),lower.panel = NULL,pch = 21,gap = 1/100)
+
+
+train %>% 
+  dplyr::select(-fake,-private,-profile_pic,-name_username,-external_url) %>% 
+  ggstatsplot::ggcorrmat() + ggtitle("Pearson Correlation") 
+
+train %>% 
+  dplyr::select(-fake,-private,-profile_pic,-name_username,-external_url) %>% 
+  ggstatsplot::ggcorrmat(type = "np") + ggtitle("Spearman Correlation")
+
+train %>% 
+  dplyr::select(-fake,-private,-profile_pic,-name_username,-external_url) %>% 
+  ggstatsplot::ggcorrmat(type = "r") + ggtitle("Robust Correlation")
+
+```
+
+# Prepprocess
+The predictors were transformed using yeoJohnson transformations, centered and scaled, searched for near zero variance predictors, and searched for a predictor space with kendal correlation less than .80.
+```{r preproc}
+# Do nothing to the data
+full_predictors <- recipe(fake~.,data = train)
+
+trans_predictors <- recipe(fake~., data = train) %>%
+  # Transform data to make more symetric
+  step_YeoJohnson(all_numeric_predictors(),-private,-profile_pic,-name_username,-external_url) %>% 
+  step_center(all_numeric_predictors(),-private,-profile_pic,-name_username,-external_url) %>% 
+  step_scale(all_numeric_predictors(),-private,-profile_pic,-name_username,-external_url) %>% 
+  step_nzv(all_predictors()) %>% 
+  step_corr(all_predictors(), method = "kendal", threshold = .8)
+
+```
+
+```{r resamples}
+set.seed(1180) # for reproducibility
+folds <- vfold_cv(train, k = 10, strata = fake)
+```
+
+# Modeling
+While often overlooked, the metric used to assess the effectiveness of a model to predict the outcome is very important and can influence the conclusions. The metrics select to evaluate model performance depend on the response variable. The outcome being a binary categorical variable. Accuracy, sensitivity, specificity, kappa, and area under the curve were used to evaluate each model's performance. \
+
+The models tried on this data include logistic regression, linear discriminant analysis, regularized discriminant analysis, flexible discriminant analysis, k-nearest neighbors, single-layer neural network, and C5 boosted trees.
+```{r control-params}
+metrics <- metric_set(kap,accuracy,sens,yardstick::spec,roc_auc) # Metrics for models
+ctrl <- control_grid(verbose = TRUE,save_pred = TRUE,save_workflow = TRUE) # Grid parameters
+```
+
+
+```{r model-specs}
+# Linear Models
+logistic_spec <- logistic_reg(
+  engine = "glmnet", 
+  penalty = tune::tune(), 
+  mixture = tune::tune()
+  )
+
+library(discrim) # disriminat analysis function and naive bayes
+
+lda_spec <- discrim_linear(
+  engine = "mda", # for tuning penalty
+  penalty = tune::tune()
+  )
+
+rda_spec <- discrim_regularized(
+  engine = "klaR",
+  frac_common_cov = tune::tune(), # flex between lda and qda
+  frac_identity = tune::tune()    # should predictors be treated independent
+  )
+
+fda_spec <- discrim_flexible(
+  engine = "earth", 
+  num_terms = tune::tune(), 
+  prod_degree = tune::tune()
+  )
+
+knn_spec <- nearest_neighbor(
+  mode = "classification", 
+  engine = "kknn", 
+  neighbors = tune::tune()
+  )
+
+nnet_spec <- mlp(
+  mode = "classification",
+  engine ="nnet",
+  hidden_units = tune::tune(),
+  penalty = tune::tune(),
+  epochs = 500,
+  dropout = tune::tune()
+  )
+
+# tree models only going to try one for the sake of time.
+boost_spec <- boost_tree(
+  mode="classification", 
+  engine = "C5.0",
+  trees = 100,
+  min_n = tune::tune(),
+  sample_size = tune::tune())
+```
+
+
+### Logistic Model
+This models was created usinhg the penalized version (elastic net) that conducts feature selection during model training. 10 values of the ridge and lasso penalty combinations were examined, using a space filling design.
+```{r}
+logistic_grid <- grid_latin_hypercube(penalty(),mixture(),size = 10) 
+```
+
+```{r}
+logistic_wf <- workflow_set(list(trans_predictors), models = list(logistic_spec))
+
+logistic_wf <- workflow_map(
+  logistic_wf,
+  "tune_grid",
+  resamples = folds,
+  metrics = metrics,
+  control = ctrl,
+  grid = logistic_grid,
+  verbose = TRUE
+  )
+
+logistic_wf %>% autoplot() + 
+  geom_line(color = "blue") + 
+  theme(legend.position = "none") + 
+  ggtitle("Logistic Regression Metrics") +
+  xlab("Resample")
+```
+
+### LDA Model
+This models was created using the penalized version that conducts feature selection during model training. 10 values of the ridge penalty was investigated, using a space filling design.
+```{r}
+lda_grid <- grid_latin_hypercube(penalty(), size = 10)
+```
+
+```{r}
+lda_wf <- workflow_set(list(trans_predictors), models = list(lda_spec))
+
+lda_wf <- workflow_map(
+  lda_wf,
+  "tune_grid",
+  resamples = folds,
+  metrics = metrics,
+  control = ctrl,
+  grid = lda_grid,
+  verbose = TRUE
+  )
+
+lda_wf %>% autoplot() + geom_line(color = "blue")
+```
+
+### RDA Model
+This model was created using a space filling design with 10 combination values for fraction common variance that toggles between LDA and QDA by putting a penalty on the covariance matrix $\lambda \Sigma_l + (1-\lambda)\Sigma$ when $\lambda$ is zero we get LDA and when $\lambda$ is 1 we get QDA. For $\lambda$ values between 0 and 1 we get something between LDA and QDA. Fraction identity buts a penalty on the pooled covariance matrix and allows the matrix to morph from its observed value to one where the predictors are assumed to be indepenent. Tuning an RDA model over these parameters enables the training data to decide the most appropriate  assumptions for the model.
+```{r}
+rda_grid <- grid_latin_hypercube(frac_common_cov(),frac_identity(),size = 10)
+```
+
+```{r}
+rda_wf <- workflow_set(list(trans_predictors), models = list(rda_spec))
+
+rda_wf <- workflow_map(
+  rda_wf,
+  "tune_grid",
+  resamples = folds,
+  metrics = metrics,
+  control = ctrl,
+  grid = rda_grid,
+  verbose = TRUE
+  )
+rda_wf %>% autoplot() + geom_line(color = "blue")
+```
+
+### FDA Model
+This model, first-degree and second-degree MARS hinge functions were used and the number of retained terms was varied from 2 to 12.
+```{r}
+fda_grid <- grid_latin_hypercube(prod_degree(),finalize(num_terms(),train),size = 10)
+```
+
+```{r}
+fda_wf <- workflow_set(list(trans_predictors), models = list(fda_spec))
+
+fda_wf <- workflow_map(
+  fda_wf,
+  "tune_grid",
+  resamples = folds,
+  metrics = metrics,
+  control = ctrl,
+  grid = fda_grid,
+  verbose = TRUE
+  )
+
+fda_wf %>% autoplot() + geom_line(color = "blue")
+```
+
+### KNN Model
+this model, k varied from 1 to 10.
+```{r}
+knn_grid <- grid_latin_hypercube(neighbors(), size = 100)
+```
+
+```{r}
+knn_wf <- workflow_set(preproc = list(trans_predictors), models = list(knn_spec))
+
+knn_wf <- workflow_map(
+  knn_wf,
+  "tune_grid",
+  resamples = folds,
+  metrics = metrics,
+  control = ctrl,
+  grid = knn_grid,
+  verbose = TRUE
+  )
+knn_wf %>% autoplot() + geom_line(color = "blue")
+```
+
+### NNet Model
+Models were fit with hidden units ranging from 2 to 10 and 10 weight decay values determined using a space filling design.
+```{r}
+nnet_grid <- grid_latin_hypercube(hidden_units(),penalty(),dropout(),size = 10)
+```
+
+```{r}
+nnet_wf <- workflow_set(preproc = list(trans_predictors), models = list(nnet_spec))
+
+nnet_wf <- workflow_map(
+  nnet_wf,
+  "tune_grid",
+  verbose = TRUE,
+  resamples = folds,
+  metrics = metrics,
+  control = ctrl
+  )
+nnet_wf %>% autoplot() + geom_line(color = "blue")
+```
+
+### C5.0 Boosted Model
+This model was evaluated with tree-based models, up to 100 iterations of boosting and tuned over sample_size and min_n.
+```{r boost-wf}
+boost_wf <- workflow_set(preproc = list(trans_predictors),models = list(boost_spec))
+boost_wf <- workflow_map(boost_wf,
+                         "tune_grid", verbose = TRUE,
+                         resamples = folds,
+                         control = ctrl,
+                         metrics = metrics
+                         )
+
+boost_wf %>% autoplot() + geom_line(color = "blue")
+```
+
+### Training Results
+The model results are shown below. The plot show the confidence interval of the resamples over the different metrics. The linear models did just as well as the non-linear models. The best non-linear model is the neural network and the best linear model is the logistic regression. To see if these two models are statistically different a t-test can be performed. I did not do this in this analysis.
+```{r}
+# Show all models
+# un-comment to see all models at once
+# logistic_wf %>% 
+  # bind_rows(lda_wf) %>% 
+  # bind_rows(rda_wf) %>% 
+  # bind_rows(fda_wf) %>%
+  # bind_rows(knn_wf) %>% 
+  # bind_rows(nnet_wf) %>% 
+  # bind_rows(boost_wf) %>% 
+  # autoplot() +
+  # ggtitle("Show All Models")
+
+# Only show best model from each model
+logistic_wf %>% 
+  bind_rows(lda_wf) %>% 
+  bind_rows(rda_wf) %>% 
+  bind_rows(fda_wf) %>%
+  bind_rows(knn_wf) %>% 
+  bind_rows(nnet_wf) %>% 
+  bind_rows(boost_wf) %>% 
+  autoplot(select_best = TRUE) +
+  ggtitle("Show Only Best Models")
+```
+
+# Results
+The best two models were logistic regression and the single-layer neural network. We can see our models dropped in accuracy quite a bit on the testing data, and the logistic regression predicted one more class correctly than the single-layer neural network. The logistic regression model misclassified 12 observations, while the single-layer neural network misclassified 13. Given the simplicity of the logistic regression model, it would be chosen as the overall model. The logistic regression has a false positive rate of 10.77%. And a true positive rate of 91.8%. Meaning when the model predicts genuine, it is right 91.8% of the time, and when the model predicts spam, it is wrong 10.77% of the time.
+```{r test-fit}
+# Get model workflow
+final_wf_logistic <- logistic_wf %>% extract_workflow(id = "recipe_logistic_reg")
+final_wf_mlp <- nnet_wf %>% extract_workflow(id = "recipe_mlp")
+
+# get workflow results for best model
+logistic_wf_res <- logistic_wf %>% extract_workflow_set_result(id = "recipe_logistic_reg")
+mlp_wf_res <- nnet_wf %>% extract_workflow_set_result(id = "recipe_mlp")
+
+# Get best model
+logistic_best <- logistic_wf_res %>% select_best(metric = "sens")
+mlp_best <- mlp_wf_res %>% select_best(metric = "sens")
+
+# Update workflow with best model
+logistic_wf_fl <- finalize_workflow(final_wf_logistic,logistic_best)
+mlp_wf_fl <- finalize_workflow(final_wf_mlp, mlp_best)
+
+# fit model on testing data
+logistic_res <- last_fit(logistic_wf_fl,split = splits)
+mlp_res <- last_fit(mlp_wf_fl,split = splits)
+```
+
+```{r test-results}
+logistic_res %>% collect_metrics() 
+mlp_res %>% collect_metrics()
+```
+
+```{r conf-mat,include=TRUE}
+print("logistic Regression")
+logistic_res %>%
+  collect_predictions() %>% 
+  conf_mat(.pred_class,truth=fake) # sens 91.8%, spec 89.23%, acc 90.48%
+
+print("single-layer neural network")
+mlp_res %>%
+  collect_predictions() %>% 
+  conf_mat(.pred_class,truth=fake) # sens 89.06%, spec 90.32%, acc 89.97%
+```
+
